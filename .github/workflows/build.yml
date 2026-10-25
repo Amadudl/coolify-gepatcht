@@ -1,0 +1,147 @@
+name: build
+
+# Stuendlich: fehlt fuer die neueste Coolify Version (oder eine fest gepinnte) das Tag
+# in GHCR, wird es gebaut. Coolifys upgrade.sh zieht das Abbild aus
+# docker-compose.custom.yml und bricht ab, wenn das Tag fehlt.
+# Push auf main und Handstart bauen alle Zielversionen neu (Dockerfile geaendert).
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/amadudl/coolify-gepatcht
+  # Laufende Version auf newserver, wird immer bereitgehalten.
+  PINNED: '4.5.0'
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Versionen ermitteln
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -eu
+          LATEST=$(gh api 'repos/coollabsio/coolify/releases?per_page=100' \
+            --jq '.[] | select(.prerelease == false and .draft == false) | .tag_name' \
+            | sed -n 's/^v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' | sort -V | tail -n 1)
+          [ -n "$LATEST" ] || { echo "Keine Coolify Version gefunden"; exit 1; }
+          echo "Neueste Coolify Version: $LATEST, gepinnt: $PINNED" >> "$GITHUB_STEP_SUMMARY"
+
+          export DOCKER_CONFIG="${RUNNER_TEMP}/docker-ghcr"
+          mkdir -p "$DOCKER_CONFIG"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          AUTH=$(printf '%s:%s' "${GITHUB_ACTOR}" "$GH_TOKEN" | base64 -w0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH" > "$DOCKER_CONFIG/config.json"
+
+          MATRIX='[]'
+          for V in $(printf '%s\n%s\n' "$LATEST" "$PINNED" | sort -uV); do
+            if ! docker manifest inspect "coollabsio/coolify:${V}" >/dev/null 2>&1; then
+              echo "coollabsio/coolify:${V} noch nicht auf Docker Hub, spaeter erneut" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            if [ "$EVENT" = schedule ] && docker manifest inspect "${IMAGE}:${V}" >/dev/null 2>&1; then
+              echo "${IMAGE}:${V} vorhanden" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            if [ "$V" = "$LATEST" ]; then L=true; else L=false; fi
+            MATRIX=$(echo "$MATRIX" | jq -c --arg v "$V" --argjson l "$L" '. + [{version: $v, latest: $l}]')
+          done
+          echo "Zu bauen: $MATRIX" >> "$GITHUB_STEP_SUMMARY"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      TRIVY: aquasec/trivy:0.76.1
+      VERSION: ${{ matrix.version }}
+      LATEST: ${{ matrix.latest }}
+    steps:
+      - name: Quelle holen
+        run: |
+          git init -q .
+          git fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}" "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+
+      - name: Basisabbild festlegen
+        run: |
+          set -eu
+          docker pull -q "coollabsio/coolify:${VERSION}"
+          BASE=$(docker image inspect -f '{{index .RepoDigests 0}}' "coollabsio/coolify:${VERSION}")
+          CF=$(docker run --rm --entrypoint cloudflared "$BASE" --version | sed -n 's/^cloudflared version \([0-9][0-9.]*\) .*/\1/p')
+          [ -n "$CF" ] || { echo "cloudflared Version im Basisabbild nicht lesbar"; exit 1; }
+          echo "BASE=$BASE" >> "$GITHUB_ENV"
+          echo "CLOUDFLARED_REF=$CF" >> "$GITHUB_ENV"
+          echo "Coolify ${VERSION}: Basis $BASE, cloudflared $CF" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bauen
+        run: |
+          docker build --pull=false \
+            --build-arg "BASE=$BASE" \
+            --build-arg "CLOUDFLARED_REF=$CLOUDFLARED_REF" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.base.name=${BASE}" \
+            --label "org.opencontainers.image.description=Coolify ${VERSION} mit neu gebautem mc und cloudflared (aktuelles Go, gepatchte Module)" \
+            -t "local/coolify:${VERSION}" .
+
+      - name: Pruefen
+        run: sh test.sh "$BASE" "local/coolify:${VERSION}"
+
+      - name: Scannen
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY" image --quiet --scanners vuln \
+            --format table "local/coolify:${VERSION}"
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY" image --quiet --scanners vuln \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "local/coolify:${VERSION}"
+
+      - name: Veroeffentlichen
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Zugang nur fuer diesen Schritt in einer eigenen Docker Konfiguration (ohne docker login)
+          export DOCKER_CONFIG="${RUNNER_TEMP}/docker-ghcr"
+          mkdir -p "$DOCKER_CONFIG"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          AUTH=$(printf '%s:%s' "${GITHUB_ACTOR}" "$GH_TOKEN" | base64 -w0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH" > "$DOCKER_CONFIG/config.json"
+          TAGS="${VERSION}"
+          if [ "$LATEST" = true ]; then TAGS="$TAGS latest"; fi
+          for TAG in $TAGS; do
+            docker tag "local/coolify:${VERSION}" "${IMAGE}:${TAG}"
+            docker push -q "${IMAGE}:${TAG}"
+          done
+          DIGEST=$(docker image inspect -f '{{index .RepoDigests 0}}' "${IMAGE}:${VERSION}")
+          echo "Veroeffentlicht: ${IMAGE} Tags ${TAGS} als ${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
